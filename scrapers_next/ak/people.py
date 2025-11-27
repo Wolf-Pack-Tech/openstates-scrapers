@@ -1,152 +1,178 @@
+from dataclasses import dataclass
 import re
-import attr
-from spatula import HtmlPage, HtmlListPage, XPath, CSS, SelectorError
+
+from lxml.etree import Element
+import lxml.html
+from lxml.html import HtmlComment
+import requests
+import scrapelib
+from spatula.pages import HtmlPage, HtmlListPage, SkipItem
+from spatula.selectors import CSS
+from spatula.sources import Source
+
 from openstates.models import ScrapePerson
+from openstates.models.people import PartyName, RoleType
+from openstates.utils.scrape import decode_cf_email
 
 
-def format_address(ad_str):
-    whitespace_collapsed = re.sub(r"\s\s+", " ", ad_str)
-    city_state_comma = re.sub(" AK", ", AK", whitespace_collapsed)
-    addr_lines_comma = re.sub(r"(\d+) (\d+)", r"\1, \2", city_state_comma)
-    return addr_lines_comma
+@dataclass
+class PartialPerson:
+    list_url: str
+    chamber: str
 
 
-@attr.s(auto_attribs=True)
-class PartialMember:
-    url: str
-    chamber: str = ""
+def format_address(original_address: str) -> str:
+    return re.sub(" AK,", ", AK", original_address)
 
 
-class LegDetail(HtmlPage):
-    example_source = "http://www.akleg.gov/basis/Member/Detail/32?code=BCH"
+def get_detail(context: Element, label: str, extra_xpath: str = "") -> Element:
+    return context.xpath(f".//strong[normalize-space(.)='{label}']{extra_xpath}")[0]
+
+
+class LatestSource(Source):
+    """
+    Get the latest session URL
+    """
+
+    retries = 0
+
+    def get_response(self, scraper: scrapelib.Scraper) -> requests.models.Response:
+        self.url = "https://www.akleg.gov/basis/mbr_info.asp"
+        resp = scraper.get(self.url)
+        root = lxml.html.fromstring(resp.content)
+        current_year = CSS("#year option:last-child").match_one(root).get("value")
+
+        if not current_year:
+            return resp
+
+        self.url = f"{self.url}?session={current_year}"
+        return scraper.get(self.url)
+
+
+class PersonDetail(HtmlPage):
+    example_source = "https://www.akleg.gov/basis/Member/Detail/34?code=ALR"
 
     def process_page(self):
+        details_div = CSS(".bioright").match_one(self.root)
 
-        details_div = CSS(".bioright").match(self.root)[0]
+        leadership_title_nodes = CSS(".leadership_title").match(details_div, min_items=0)
+        leadership_title = leadership_title_nodes[0].text_content() if leadership_title_nodes else ""
+        if "Name Changed" in leadership_title:
+            raise SkipItem("Duplicate page; name changed")
 
-        name_span = CSS(".formal_name").match(details_div)[0].text_content()
-        name_list = name_span.split(" ")
-        given_name = name_list[1]
-        family_name = " ".join(name_list[2:])
+        name_raw = CSS(".formal_name").match_one(details_div).text_content()
+        _title, given_name, family_name = name_raw.split(" ", 2)
 
-        email = CSS("a").match(details_div)[0].text_content().strip()
+        hashed_email = get_detail(details_div, "Email:", "/following::a[1]").get("href").split("#")[1]
+        email = decode_cf_email(hashed_email)
 
-        div_text = details_div.text_content().replace("\r\n", " ")
-
-        details = {
-            "District": "",
-            "Party": "",
-            "Toll-Free": "",
-            "Phone": "",
-            "Fax": "",
-        }
-
-        for pattern in details.keys():
-            pattern_match = re.search(rf"({pattern})(:\s+)(\S+)", div_text)
-            if pattern_match:
-                details[pattern] = pattern_match.groups()[-1]
-
-        cap_ad_match = re.search(
-            r"(State.+Room \d+)\s+(.+\s+AK,\s99801)(.+Contact)", div_text
-        )
-        if cap_ad_match:
-            raw_session_contact = ", ".join(cap_ad_match.groups()[:2])
-            session_contact = format_address(raw_session_contact)
-            details["Capitol Address"] = session_contact
-
-        dist_ad_match = re.search(
-            r"(Interim Contact)\s+(\S+.+\S)\s\s+(.+99\d{3})", div_text
-        )
-        if dist_ad_match:
-            raw_district_contact = ", ".join(dist_ad_match.groups()[1:])
-            district_contact = format_address(raw_district_contact)
-            details["District Address"] = district_contact
-
-        dist_phone_match = re.search(r"(Interim.+Phone:)\s+(\S+)", div_text)
-        if dist_phone_match:
-            district_phone = dist_phone_match.groups()[1]
-            details["District Phone"] = district_phone
-
-        party_formatting = {
-            "Democrat": "Democratic",
-            "Republican": "Republican",
-            "Not": "Independent",
-        }
-        listed_party = details["Party"]
-        party = party_formatting[listed_party]
+        district = get_detail(details_div, "District:").tail.strip()
+        party_text = get_detail(details_div, "Party:").tail.strip()
+        party = {
+            "Democrat": PartyName.DEM,
+            "Republican": PartyName.REP,
+            "Not Affiliated": PartyName.IND,
+        }[party_text]
 
         image = CSS(".legpic").match_one(self.root).get("src")
 
         p = ScrapePerson(
             name=f"{given_name} {family_name}",
+            state="ak",
+            party=party,
+            district=district,
+            chamber=self.input.chamber,
+            image=image,
+            email=email,
             given_name=given_name,
             family_name=family_name,
-            state="ak",
-            chamber=self.input.chamber,
-            party=party,
-            image=image,
-            district=details["District"],
-            email=email,
         )
 
-        try:
-            leadership_title = (
-                CSS(".leadership_title").match(details_div)[0].text_content()
-            )
-            p.extras["title"] = leadership_title
-        except SelectorError:
-            pass
+        # Yield lines after a label
+        def yield_lines(label: str):
+            cursor = get_detail(details_div, label)
+            while True:
+                cursor = cursor.getnext()
 
-        if details.get("Phone"):
-            p.capitol_office.voice = details["Phone"]
+                # If reached end of section
+                if cursor is None:
+                    break
 
-        if details.get("District Phone"):
-            p.district_office.voice = details["District Phone"]
+                if cursor.tag != 'br' and type(cursor) is not HtmlComment:
+                    break
 
-        if details.get("Fax"):
-            p.district_office.fax = details["Fax"]
+                tail_text = cursor.tail.strip() or ''
+                if tail_text:
+                    yield tail_text
 
-        if details.get("District Address"):
-            p.district_office.address = details["District Address"]
-        p.district_office.name = "interim contact"
+        # Links
+        p.add_link(str(self.source), "member detail page")
 
-        if details.get("Capitol Address"):
-            p.capitol_office.address = details["Capitol Address"]
+        # Sources
+        p.add_source(self.input.list_url, "member list page")
+        p.add_source(str(self.source), "member detail page")
+
+        # TODO: other_names
+        # TODO: Track name changes
+
+        # TODO: ids
+
+        # Capitol Office
         p.capitol_office.name = "session contact"
+        def process_session_contact():
+            lines = list(yield_lines("Session Contact"))
+            p.capitol_office.address = format_address(", ".join(lines[:2]))
+            lines = lines[2:]
+            for line in lines:
+                contact_type, number = line.split(": ", 1)
+                if contact_type == "Phone":
+                    p.capitol_office.voice = number
+                elif contact_type == "Fax":
+                    p.capitol_office.fax = number
+                else:
+                    raise ValueError(f"Unknown contact type: {contact_type}")
+        process_session_contact()
 
-        if details.get("Toll-Free"):
-            p.extras["toll_free_phone"] = details["Toll-Free"]
+        # District Office
+        p.district_office.name = "interim contact"
+        def process_district_contact():
+            lines = list(yield_lines("Interim Contact"))
+            p.district_office.address = format_address(", ".join(lines[:2]))
+            lines = lines[2:]
+            for line in lines:
+                contact_type, number = line.split(": ", 1)
+                if contact_type == "Phone":
+                    p.district_office.voice = number
+                elif contact_type == "Fax":
+                    p.district_office.fax = number
+                else:
+                    raise ValueError(f"Unknown contact type: {contact_type}")
+        process_district_contact()
 
-        source_url = str(self.source)
-        p.add_source(source_url, "member detail page")
+        # TODO: additional_offices
 
-        session_match = re.search(r"(Detail/)(\d+)", source_url)
-        session = session_match.groups()[1]
-        p.add_source(
-            f"https://www.akleg.gov/basis/mbr_info.asp?session={session}",
-            "member list page",
-        )
+        # Extras
+        p.extras["toll_free_phone"] = get_detail(details_div, "Toll-Free:").tail.strip()
+        if leadership_title:
+            p.extras["title"] = leadership_title
 
         return p
 
 
-class LegList(HtmlListPage):
-    session_num = "33"
-    source = f"https://www.akleg.gov/basis/mbr_info.asp?session={session_num}"
-    selector = XPath("//html/body/div[2]/div/div/table//tr[position()>1]/td[1]/nobr/a")
+class PeopleList(HtmlListPage):
+    source = LatestSource()
+    selector = CSS("#members tr td:first-child a")
 
     def process_item(self, item):
         title = item.text_content()
-        title_list = title.strip().split(" ")
-        chamber = title_list[0]
+        chamber = title.strip().split(" ", 1)[0]
 
         if chamber == "Senator":
-            chamber = "upper"
+            chamber = RoleType.UPPER
         elif chamber == "Representative":
-            chamber = "lower"
+            chamber = RoleType.LOWER
 
-        source = item.get("href")
+        source = re.sub("http://", "https://", item.get("href"))
+        input = PartialPerson(chamber=chamber, list_url=str(self.source))
 
-        p = PartialMember(chamber=chamber, url=self.source.url)
-
-        return LegDetail(p, source=source)
+        return PersonDetail(input, source=source)
