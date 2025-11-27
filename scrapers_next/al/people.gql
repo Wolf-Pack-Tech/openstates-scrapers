@@ -1,0 +1,44 @@
+query legislativeMembers {
+  legislativeMembers(
+    where: {
+      active: {eq: true}
+      # affiliation: {in: [D, R]},
+      body: {in: [House, Senate]},
+      elected: {eq: true},
+      # leader: {eq: true},
+    }
+    # search: $search
+    # order: $order
+  ) {
+    data {
+      id
+      body
+      affiliation
+
+      # honorificFullNameAffiliation
+      leadershipTitle
+      fullName
+      firstName
+      lastName
+
+      imageUrl
+      district
+      counties
+
+      fullAddress
+      phone
+      fax
+      email
+
+      fullDistrictAddress
+      # districtOffice
+      districtPhone
+      districtFax
+      districtEmail
+
+      # bio
+      # __typename
+    }
+    # __typename
+  }
+}
