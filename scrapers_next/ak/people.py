@@ -86,6 +86,7 @@ class PersonDetail(HtmlPage):
             email=email,
             given_name=given_name,
             family_name=family_name,
+            suffix="",
         )
 
         # Yield lines after a label

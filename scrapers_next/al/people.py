@@ -73,6 +73,7 @@ class MemberList(JsonListPage):
             email=item["email"] or "",
             given_name=item["firstName"],
             family_name=item["lastName"],
+            suffix="",
         )
 
         p.add_source(
